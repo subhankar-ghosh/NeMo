@@ -7,6 +7,7 @@ from typing import Generic, Optional, Tuple, TypeVar
 
 import pytorch_lightning as pl
 from filelock import FileLock, Timeout
+from pytorch_lightning.trainer.states import TrainerFn
 
 # Dynamically inherit from the correct Path subclass based on the operating system.
 if os.name == 'nt':
@@ -145,18 +146,20 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
             pl.Trainer: The trainer configured with the model and strategy.
         """
         from nemo.lightning import MegatronStrategy, Trainer
-        from nemo.lightning._strategy_lib import megatron_lazy_init_context
+        from nemo.lightning._strategy_lib import megatron_cpu_init_context
 
         _trainer = trainer or Trainer(
-            devices=1, accelerator="cpu", strategy=MegatronStrategy(store_optimizer_states=False)
+            devices=1,
+            accelerator="cpu",
+            strategy=MegatronStrategy(ckpt_save_optimizer=False, always_save_context=True),
         )
-
+        _trainer.state.fn = TrainerFn.FITTING
         _trainer.strategy.connect(model)
         _trainer.strategy.setup_environment()
 
         if not model.state_dict():
-            _trainer.strategy.lazy_init = True
-            with _trainer.init_module(), megatron_lazy_init_context(model.config):
+            _trainer.strategy.lazy_init = False
+            with _trainer.init_module(), megatron_cpu_init_context(model.config):
                 model.configure_model()
 
         return _trainer
@@ -173,13 +176,14 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
         trainer.strategy._setup_optimizers = False
         trainer.strategy._init_model_parallel = False
         trainer.strategy.setup(trainer)
-        trainer.save_checkpoint(output_path)
+        output_path = Path(output_path)
+        trainer.save_checkpoint(output_path / "weights")
 
         from nemo.lightning.io.pl import TrainerContext
         from nemo.utils.get_rank import is_global_rank_zero
 
         if is_global_rank_zero() and dump_io:
-            TrainerContext.from_trainer(trainer).io_dump(output_path)
+            TrainerContext.from_trainer(trainer).io_dump(output_path / "context")
 
     def nemo_load(
         self, path: Path, trainer: Optional[pl.Trainer] = None, cpu: bool = True
@@ -201,7 +205,9 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
 
         model = load_context(path).model
         _trainer = trainer or Trainer(
-            devices=1, accelerator="cpu" if cpu else "gpu", strategy=MegatronStrategy(ddp="pytorch")
+            devices=1,
+            accelerator="cpu" if cpu else "gpu",
+            strategy=MegatronStrategy(ddp="pytorch", ckpt_save_optimizer=False),
         )
 
         _trainer.strategy.connect(model)
