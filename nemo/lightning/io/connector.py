@@ -133,35 +133,42 @@ class ModelConnector(Connector, Generic[SourceT, TargetT]):
             Loads a model from the specified path, optionally using a CPU-focused strategy, and returns the model and trainer.
     """
 
-    def nemo_setup(self, model: pl.LightningModule, trainer: Optional[pl.Trainer] = None) -> pl.Trainer:
+    def nemo_setup(
+        self, model: pl.LightningModule, trainer: Optional[pl.Trainer] = None, lazy_init: bool = True
+    ) -> pl.Trainer:
         """
         Sets up the model and trainer using a specified strategy, preparing it for training or inference.
 
         Args:
             model (pl.LightningModule): The model to be set up.
             trainer (Optional[pl.Trainer]): The trainer to be used, if not provided a new one will be created.
-
+            lazy_init (bool): If you want to lazily initialize your target model on a meta device rather than fully on
+                the GPU. Note that when you lazily initialize on a meta device and do not fully initialize later, you
+                may have difficulties getting weights into the new model.
         Returns
         -------
             pl.Trainer: The trainer configured with the model and strategy.
         """
-        from nemo.lightning import MegatronStrategy, Trainer
-        from nemo.lightning._strategy_lib import megatron_cpu_init_context
+        from nemo.lightning import MegatronStrategy, Trainer, _strategy_lib
 
         _trainer = trainer or Trainer(
             devices=1,
             accelerator="cpu",
             strategy=MegatronStrategy(ckpt_save_optimizer=False, always_save_context=True),
         )
-        _trainer.state.fn = TrainerFn.FITTING
+        _trainer.state.fn = TrainerFn.FITTING  # needed for proper save.
         _trainer.strategy.connect(model)
         _trainer.strategy.setup_environment()
 
         if not model.state_dict():
-            _trainer.strategy.lazy_init = False
-            with _trainer.init_module(), megatron_cpu_init_context(model.config):
-                model.configure_model()
-
+            _trainer.strategy.lazy_init = lazy_init
+            with _trainer.init_module():
+                if lazy_init:
+                    with _strategy_lib.megatron_lazy_init_context(model.config):
+                        model.configure_model()
+                else:
+                    with _strategy_lib.megatron_cpu_init_context(model.config):
+                        model.configure_model()
         return _trainer
 
     def nemo_save(self, output_path: Path, trainer: pl.Trainer, dump_io: bool = True) -> None:
